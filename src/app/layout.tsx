@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "NFL Market Scanner",
+  title: "NFL Market Odds Intelligence",
   description: "Read-only Kalshi NFL candidate decisions",
 };
 
