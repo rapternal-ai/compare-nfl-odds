@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { JSONValue } from "postgres";
-import type { DecisionAction, Market, Orderbook, RiskConfig, ScanRecord } from "@/domain/types";
-import type { PaperFill, PaperOrder, PaperPosition } from "@/domain/portfolio";
+import type { CandidateDecision, DecisionAction, Market, Orderbook, RiskConfig, ScanRecord } from "@/domain/types";
+import { executePaperEntry, type PaperFill, type PaperOrder, type PaperPosition } from "@/domain/portfolio";
 import type { Database } from "./client";
 
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -196,6 +196,36 @@ export async function getMarketHistory(sql: Database, ticker: string, limit = 10
   };
 }
 
+export interface PaperControlState {
+  risk: RiskConfig;
+  newEntriesPaused: boolean;
+  updatedAt: string | null;
+}
+
+export async function getPaperControlState(sql: Database, fallback: RiskConfig): Promise<PaperControlState> {
+  const [configs, settings] = await Promise.all([
+    sql`SELECT config, created_at FROM risk_config_versions ORDER BY id DESC LIMIT 1`,
+    sql`SELECT new_entries_paused, updated_at FROM app_settings WHERE id = true`,
+  ]);
+  const config = configs[0]?.config;
+  return {
+    risk: config ? (typeof config === "string" ? JSON.parse(config) : config) as RiskConfig : fallback,
+    newEntriesPaused: settings[0]?.new_entries_paused ?? false,
+    updatedAt: settings[0]?.updated_at ?? configs[0]?.created_at ?? null,
+  };
+}
+
+export async function saveRiskConfig(sql: Database, config: RiskConfig) {
+  await sql`INSERT INTO risk_config_versions (config) VALUES (${sql.json(config as unknown as JSONValue)})`;
+}
+
+export async function setNewEntriesPaused(sql: Database, paused: boolean) {
+  await sql`
+    INSERT INTO app_settings (id, new_entries_paused, updated_at) VALUES (true, ${paused}, now())
+    ON CONFLICT (id) DO UPDATE SET new_entries_paused = EXCLUDED.new_entries_paused, updated_at = EXCLUDED.updated_at
+  `;
+}
+
 export interface PortfolioSummary {
   cashCents: number;
   atRiskCents: number;
@@ -252,8 +282,8 @@ export async function loadPortfolio(sql: Database, risk: RiskConfig, now: Date):
 export async function persistPaperEntry(sql: Database, order: PaperOrder, fill: PaperFill, position: PaperPosition) {
   await sql.begin(async (transaction) => {
     await transaction`
-      INSERT INTO paper_orders (id, ticker, side, limit_price_cents, requested_quantity, filled_quantity, status, created_at)
-      VALUES (${order.id}, ${order.ticker}, ${order.side}, ${order.limitPriceCents}, ${order.requestedQuantity}, ${order.filledQuantity}, ${order.status}, ${order.createdAt})
+      INSERT INTO paper_orders (id, decision_key, ticker, side, limit_price_cents, requested_quantity, filled_quantity, status, created_at)
+      VALUES (${order.id}, ${order.decisionKey}, ${order.ticker}, ${order.side}, ${order.limitPriceCents}, ${order.requestedQuantity}, ${order.filledQuantity}, ${order.status}, ${order.createdAt})
     `;
     await transaction`
       INSERT INTO paper_fills (ticker, price_cents, quantity, fee_cents, filled_at)
@@ -268,5 +298,77 @@ export async function persistPaperEntry(sql: Database, order: PaperOrder, fill: 
         total_fees_cents = EXCLUDED.total_fees_cents,
         updated_at = EXCLUDED.updated_at
     `;
+  });
+}
+
+export async function executePaperEntryAtomically(sql: Database, decision: CandidateDecision, risk: RiskConfig, now: Date) {
+  return sql.begin(async (transaction) => {
+    await transaction`SELECT pg_advisory_xact_lock(hashtext('paper-entry-risk'))`;
+    const decisionKey = `${decision.ticker}:${decision.marketAsOf}`;
+    const duplicate = await transaction`SELECT id FROM paper_orders WHERE decision_key = ${decisionKey} LIMIT 1`;
+    if (duplicate.length) return { status: "duplicate" as const, reason: "Decision already executed" };
+
+    const settings = await transaction`SELECT new_entries_paused FROM app_settings WHERE id = true`;
+    if (settings[0]?.new_entries_paused) {
+      await transaction`INSERT INTO risk_events (ticker, decision_key, event_type, reason) VALUES (${decision.ticker}, ${decisionKey}, 'entry_blocked', 'New paper entries are paused')`;
+      return { status: "rejected" as const, reason: "New paper entries are paused" };
+    }
+
+    const positions = (await transaction`
+      SELECT ticker, quantity, cost_basis_cents, total_fees_cents, created_at, updated_at
+      FROM paper_positions
+      ORDER BY ticker
+    `).map((r) => ({
+      ticker: r.ticker,
+      quantity: r.quantity,
+      costBasisCents: r.cost_basis_cents,
+      totalFeesCents: r.total_fees_cents,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+    const { start, end } = dayBounds(now);
+    const daily = await transaction`
+      SELECT COALESCE(SUM(price_cents * quantity + fee_cents), 0) AS total
+      FROM paper_fills
+      WHERE filled_at >= ${start.toISOString()} AND filled_at < ${end.toISOString()}
+    `;
+    const gameExposure = await transaction`
+      SELECT COALESCE(SUM(p.cost_basis_cents + p.total_fees_cents), 0) AS total
+      FROM paper_positions p
+      JOIN markets held_market ON held_market.ticker = p.ticker
+      JOIN markets candidate_market ON candidate_market.ticker = ${decision.ticker}
+      WHERE held_market.game_id = candidate_market.game_id
+    `;
+    const atRiskCents = positions.reduce((sum, p) => sum + p.costBasisCents + p.totalFeesCents, 0);
+    if (!decision.quote) return { status: "rejected" as const, reason: "Executable quote is unavailable" };
+    const result = executePaperEntry(decision, decision.quote, risk, {
+      cashCents: risk.startingBankrollCents - atRiskCents,
+      positions,
+      gameCostCents: Number(gameExposure[0].total),
+      dayCostCents: Number(daily[0].total),
+      dayStartsAt: start.toISOString(),
+    }, now);
+    if (result.rejection || !result.order || !result.fill || !result.position) {
+      const reason = result.rejection ?? "Paper entry was rejected";
+      await transaction`INSERT INTO risk_events (ticker, decision_key, event_type, reason) VALUES (${decision.ticker}, ${decisionKey}, 'entry_blocked', ${reason})`;
+      return { status: "rejected" as const, reason };
+    }
+
+    const { order, fill, position } = result;
+    await transaction`
+      INSERT INTO paper_orders (id, decision_key, ticker, side, limit_price_cents, requested_quantity, filled_quantity, status, created_at)
+      VALUES (${order.id}, ${order.decisionKey}, ${order.ticker}, ${order.side}, ${order.limitPriceCents}, ${order.requestedQuantity}, ${order.filledQuantity}, ${order.status}, ${order.createdAt})
+    `;
+    await transaction`
+      INSERT INTO paper_fills (ticker, price_cents, quantity, fee_cents, filled_at)
+      VALUES (${fill.ticker}, ${fill.priceCents}, ${fill.quantity}, ${fill.feeCents}, ${fill.filledAt})
+    `;
+    await transaction`
+      INSERT INTO paper_positions (ticker, quantity, cost_basis_cents, total_fees_cents, created_at, updated_at)
+      VALUES (${position.ticker}, ${position.quantity}, ${position.costBasisCents}, ${position.totalFeesCents}, ${position.createdAt}, ${position.updatedAt})
+      ON CONFLICT (ticker) DO UPDATE SET quantity = EXCLUDED.quantity, cost_basis_cents = EXCLUDED.cost_basis_cents,
+        total_fees_cents = EXCLUDED.total_fees_cents, updated_at = EXCLUDED.updated_at
+    `;
+    return { status: "filled" as const, reason: null };
   });
 }

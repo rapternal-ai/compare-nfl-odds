@@ -19,6 +19,7 @@ export interface PaperFill {
 
 export interface PaperOrder {
   id: string;
+  decisionKey: string;
   ticker: string;
   side: "buy";
   limitPriceCents: number;
@@ -31,6 +32,7 @@ export interface PaperOrder {
 export interface AccountState {
   cashCents: number;
   positions: PaperPosition[];
+  gameCostCents: number;
   dayCostCents: number;
   dayStartsAt: string;
 }
@@ -71,12 +73,12 @@ export function executePaperEntry(
     .filter((p) => p.ticker !== decision.ticker)
     .reduce((sum, p) => sum + p.costBasisCents + p.totalFeesCents, 0);
   const sameGamePosition = account.positions.find((p) => p.ticker === decision.ticker);
-  const sameGameCost = (sameGamePosition?.costBasisCents ?? 0) + (sameGamePosition?.totalFeesCents ?? 0);
+  const sameMarketCost = (sameGamePosition?.costBasisCents ?? 0) + (sameGamePosition?.totalFeesCents ?? 0);
 
-  if (sameGameCost + totalEntryCost > risk.maxOpenCostPerGameCents) {
+  if (account.gameCostCents + totalEntryCost > risk.maxOpenCostPerGameCents) {
     return { order: null, fill: null, position: null, rejection: `Game exposure would exceed ${risk.maxOpenCostPerGameCents}¢` };
   }
-  if (openPositionCost + sameGameCost + totalEntryCost > risk.maxTotalOpenCostCents) {
+  if (openPositionCost + sameMarketCost + totalEntryCost > risk.maxTotalOpenCostCents) {
     return { order: null, fill: null, position: null, rejection: `Total open exposure would exceed ${risk.maxTotalOpenCostCents}¢` };
   }
   if (account.dayCostCents + totalEntryCost > risk.maxDailyNewCostCents) {
@@ -94,8 +96,10 @@ export function executePaperEntry(
     filledAt: now.toISOString(),
   };
 
+  const decisionKey = `${decision.ticker}:${decision.marketAsOf}`;
   const order: PaperOrder = {
-    id: `paper-${decision.ticker}-${now.getTime()}`,
+    id: `paper-${decisionKey}`,
+    decisionKey,
     ticker: decision.ticker,
     side: "buy",
     limitPriceCents: quote.limitPriceCents,
