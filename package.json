@@ -1,0 +1,36 @@
+{
+  "name": "auto-market",
+  "version": "1.0.0",
+  "description": "Read-only Kalshi NFL market scanner and decision dashboard",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "build": "next build",
+    "start": "next start",
+    "worker": "node --env-file=.env.local --import tsx src/worker/index.ts",
+    "db:up": "docker compose up -d --wait postgres",
+    "db:down": "docker compose down",
+    "db:migrate": "node --env-file=.env.local --import tsx src/db/migrate.ts",
+    "test": "tsx --test src/db/*.test.ts src/domain/*.test.ts src/providers/*.test.ts src/services/*.test.ts",
+    "test:watch": "tsx --test --watch src/db/*.test.ts src/domain/*.test.ts src/providers/*.test.ts src/services/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "decimal.js": "^10.6.0",
+    "next": "^16.3.4",
+    "postgres": "^3.4.7",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.1",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "eslint": "^9.35.0",
+    "eslint-config-next": "^16.3.4",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

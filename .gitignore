@@ -1,0 +1,8 @@
+node_modules/
+.next/
+.env
+.env.local
+coverage/
+*.tsbuildinfo
+.DS_Store
+.devin/config.local.json
