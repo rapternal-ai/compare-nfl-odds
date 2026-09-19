@@ -8,7 +8,7 @@ export async function runPersistedScan(sql: Database, jobId: string, now = new D
   try {
     const result = await loadCandidates(now);
     await persistScan(sql, jobId, result.records, new Date());
-    await executePaperScan(sql, result.records, now);
+    await executePaperScan(sql, result.records, result.marketData, now);
     return result;
   } catch (error) {
     await failJob(sql, jobId, error);

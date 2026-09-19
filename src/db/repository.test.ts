@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
 import { createDatabase } from "./client";
 import { defaultRisk } from "@/domain/config";
-import { executePaperEntryAtomically } from "./repository";
+import { executePaperEntryAtomically, fillActivePaperOrder, revalidateAndExecutePaperEntry } from "./repository";
 import { runPersistedScan } from "@/services/persisted-scan";
 
 describe("persisted scan", { skip: process.env.TEST_DATABASE_INTEGRATION !== "true" }, () => {
@@ -30,6 +30,26 @@ describe("persisted scan", { skip: process.env.TEST_DATABASE_INTEGRATION !== "tr
         executePaperEntryAtomically(sql, uniqueDecision, defaultRisk, new Date("2026-09-13T12:01:00Z")),
       ]);
       assert.deepEqual(results.map(({ status }) => status).sort(), ["duplicate", "filled"]);
+
+      const partialDecision = { ...trade, marketAsOf: `${trade.marketAsOf}:${randomUUID()}` };
+      const partial = await revalidateAndExecutePaperEntry(sql, partialDecision, {
+        ticker: trade.ticker,
+        yesBids: [{ priceCents: 55, quantity: 20 }],
+        noBids: [{ priceCents: 100 - trade.quote!.limitPriceCents, quantity: 5 }],
+        asOf: "2026-09-13T12:01:00Z",
+      }, defaultRisk, new Date("2026-09-13T12:01:00Z"), 15);
+      assert.equal(partial.status, "partial");
+      const stored = await sql`SELECT status, filled_quantity, requested_quantity FROM paper_orders WHERE decision_key = ${`${partialDecision.ticker}:${partialDecision.marketAsOf}`}`;
+      assert.equal(stored[0].status, "partial");
+      assert.equal(stored[0].filled_quantity, 5);
+      assert.equal(stored[0].requested_quantity, trade.quote!.quantity);
+      const completed = await fillActivePaperOrder(sql, `paper-${partialDecision.ticker}:${partialDecision.marketAsOf}`, {
+        ticker: trade.ticker,
+        yesBids: [{ priceCents: 55, quantity: 20 }],
+        noBids: [{ priceCents: 100 - trade.quote!.limitPriceCents, quantity: trade.quote!.quantity }],
+        asOf: "2026-09-13T12:01:30Z",
+      }, defaultRisk, new Date("2026-09-13T12:01:30Z"), 15);
+      assert.equal(completed.status, "filled");
     } finally {
       process.env.MARKET_DATA_SOURCE = previousSource;
       await sql.end();

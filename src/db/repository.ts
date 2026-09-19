@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { JSONValue } from "postgres";
 import type { CandidateDecision, DecisionAction, Market, Orderbook, RiskConfig, ScanRecord } from "@/domain/types";
 import { executePaperEntry, type PaperFill, type PaperOrder, type PaperPosition } from "@/domain/portfolio";
+import { boundedYesFill } from "@/domain/pricing";
 import type { Database } from "./client";
 
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -226,11 +227,35 @@ export async function setNewEntriesPaused(sql: Database, paused: boolean) {
   `;
 }
 
+export interface PaperOrderSummary {
+  id: string;
+  ticker: string;
+  status: string;
+  limitPriceCents: number;
+  requestedQuantity: number;
+  filledQuantity: number;
+  quoteAsOf: string | null;
+  expiresAt: string | null;
+  createdAt: string;
+}
+
+export interface PaperFillSummary {
+  orderId: string | null;
+  ticker: string;
+  priceCents: number;
+  quantity: number;
+  feeCents: number;
+  filledAt: string;
+}
+
 export interface PortfolioSummary {
   cashCents: number;
   atRiskCents: number;
+  reservedCents: number;
   dayCostCents: number;
   positions: PaperPosition[];
+  orders: PaperOrderSummary[];
+  fills: PaperFillSummary[];
 }
 
 function dayBounds(now: Date) {
@@ -268,14 +293,40 @@ export async function getTodaysFillCost(sql: Database, now: Date): Promise<numbe
 }
 
 export async function loadPortfolio(sql: Database, risk: RiskConfig, now: Date): Promise<PortfolioSummary> {
-  const positions = await getOpenPositions(sql);
+  const [positions, orderRows, fillRows, reserveRows] = await Promise.all([
+    getOpenPositions(sql),
+    sql`SELECT id, ticker, status, limit_price_cents, requested_quantity, filled_quantity, quote_as_of, expires_at, created_at FROM paper_orders ORDER BY created_at DESC LIMIT 50`,
+    sql`SELECT order_id, ticker, price_cents, quantity, fee_cents, filled_at FROM paper_fills ORDER BY filled_at DESC LIMIT 50`,
+    sql`SELECT COALESCE(SUM((requested_quantity - filled_quantity) * limit_price_cents + (requested_quantity - filled_quantity) * ${risk.feeCentsPerContract}), 0) AS total FROM paper_orders WHERE status IN ('resting', 'partial')`,
+  ]);
   const atRiskCents = positions.reduce((sum, p) => sum + p.costBasisCents + p.totalFeesCents, 0);
+  const reservedCents = Number(reserveRows[0].total);
   const dayCostCents = await getTodaysFillCost(sql, now);
   return {
-    cashCents: risk.startingBankrollCents - atRiskCents,
+    cashCents: risk.startingBankrollCents - atRiskCents - reservedCents,
     atRiskCents,
+    reservedCents,
     dayCostCents,
     positions,
+    orders: orderRows.map((r) => ({
+      id: r.id,
+      ticker: r.ticker,
+      status: r.status,
+      limitPriceCents: r.limit_price_cents,
+      requestedQuantity: r.requested_quantity,
+      filledQuantity: r.filled_quantity,
+      quoteAsOf: r.quote_as_of,
+      expiresAt: r.expires_at,
+      createdAt: r.created_at,
+    })),
+    fills: fillRows.map((r) => ({
+      orderId: r.order_id,
+      ticker: r.ticker,
+      priceCents: Number(r.price_cents),
+      quantity: r.quantity,
+      feeCents: r.fee_cents,
+      filledAt: r.filled_at,
+    })),
   };
 }
 
@@ -370,5 +421,156 @@ export async function executePaperEntryAtomically(sql: Database, decision: Candi
         total_fees_cents = EXCLUDED.total_fees_cents, updated_at = EXCLUDED.updated_at
     `;
     return { status: "filled" as const, reason: null };
+  });
+}
+
+export async function expirePaperOrders(sql: Database, now: Date) {
+  const rows = await sql`
+    UPDATE paper_orders SET status = 'expired', updated_at = ${now.toISOString()}
+    WHERE status IN ('resting', 'partial') AND expires_at <= ${now.toISOString()}
+    RETURNING id
+  `;
+  return rows.length;
+}
+
+export async function getActivePaperOrders(sql: Database) {
+  const rows = await sql`
+    SELECT id, ticker FROM paper_orders
+    WHERE status IN ('resting', 'partial')
+    ORDER BY created_at
+  `;
+  return rows.map((r) => ({ id: r.id as string, ticker: r.ticker as string }));
+}
+
+export async function fillActivePaperOrder(
+  sql: Database,
+  orderId: string,
+  orderbook: Orderbook,
+  risk: RiskConfig,
+  now: Date,
+  maxQuoteAgeSeconds: number,
+) {
+  return sql.begin(async (transaction) => {
+    await transaction`SELECT pg_advisory_xact_lock(hashtext('paper-entry-risk'))`;
+    const rows = await transaction`
+      SELECT id, ticker, limit_price_cents, requested_quantity, filled_quantity, status, expires_at
+      FROM paper_orders WHERE id = ${orderId} FOR UPDATE
+    `;
+    if (!rows.length || !["resting", "partial"].includes(rows[0].status)) return { status: "closed" as const, filledQuantity: 0 };
+    if (new Date(rows[0].expires_at).getTime() <= now.getTime()) {
+      await transaction`UPDATE paper_orders SET status = 'expired', updated_at = ${now.toISOString()} WHERE id = ${orderId}`;
+      return { status: "expired" as const, filledQuantity: 0 };
+    }
+    const ageSeconds = (now.getTime() - new Date(orderbook.asOf).getTime()) / 1_000;
+    if (ageSeconds < 0 || ageSeconds > maxQuoteAgeSeconds) return { status: "stale" as const, filledQuantity: 0 };
+    const remaining = rows[0].requested_quantity - rows[0].filled_quantity;
+    const fill = boundedYesFill(orderbook, remaining, rows[0].limit_price_cents);
+    if (!fill) return { status: rows[0].status as "resting" | "partial", filledQuantity: 0 };
+    const filledQuantity = rows[0].filled_quantity + fill.quantity;
+    const status = filledQuantity === rows[0].requested_quantity ? "filled" : "partial";
+    const feeCents = fill.quantity * risk.feeCentsPerContract;
+    await transaction`UPDATE paper_orders SET filled_quantity = ${filledQuantity}, status = ${status}, quote_as_of = ${orderbook.asOf}, updated_at = ${now.toISOString()} WHERE id = ${orderId}`;
+    await transaction`INSERT INTO paper_fills (order_id, ticker, price_cents, quantity, fee_cents, filled_at) VALUES (${orderId}, ${rows[0].ticker}, ${fill.averagePriceCents}, ${fill.quantity}, ${feeCents}, ${now.toISOString()})`;
+    await transaction`
+      INSERT INTO paper_positions (ticker, quantity, cost_basis_cents, total_fees_cents, created_at, updated_at)
+      VALUES (${rows[0].ticker}, ${fill.quantity}, ${fill.totalCostCents}, ${feeCents}, ${now.toISOString()}, ${now.toISOString()})
+      ON CONFLICT (ticker) DO UPDATE SET quantity = paper_positions.quantity + EXCLUDED.quantity,
+        cost_basis_cents = paper_positions.cost_basis_cents + EXCLUDED.cost_basis_cents,
+        total_fees_cents = paper_positions.total_fees_cents + EXCLUDED.total_fees_cents, updated_at = EXCLUDED.updated_at
+    `;
+    return { status: status as "partial" | "filled", filledQuantity: fill.quantity };
+  });
+}
+
+export async function revalidateAndExecutePaperEntry(
+  sql: Database,
+  decision: CandidateDecision,
+  orderbook: Orderbook,
+  risk: RiskConfig,
+  now: Date,
+  maxQuoteAgeSeconds: number,
+  orderTtlSeconds = 60,
+) {
+  return sql.begin(async (transaction) => {
+    await transaction`SELECT pg_advisory_xact_lock(hashtext('paper-entry-risk'))`;
+    await transaction`
+      UPDATE paper_orders SET status = 'expired', updated_at = ${now.toISOString()}
+      WHERE status IN ('resting', 'partial') AND expires_at <= ${now.toISOString()}
+    `;
+    const decisionKey = `${decision.ticker}:${decision.marketAsOf}`;
+    const ageSeconds = (now.getTime() - new Date(orderbook.asOf).getTime()) / 1_000;
+    if (ageSeconds < 0 || ageSeconds > maxQuoteAgeSeconds) {
+      const reason = "Revalidated market quote is stale";
+      await transaction`INSERT INTO risk_events (ticker, decision_key, event_type, reason) VALUES (${decision.ticker}, ${decisionKey}, 'entry_blocked', ${reason})`;
+      return { status: "rejected" as const, reason };
+    }
+    const duplicate = await transaction`SELECT id FROM paper_orders WHERE decision_key = ${decisionKey} LIMIT 1`;
+    if (duplicate.length) return { status: "duplicate" as const, reason: "Decision already has a paper order" };
+    const open = await transaction`SELECT id FROM paper_orders WHERE ticker = ${decision.ticker} AND status IN ('resting', 'partial') LIMIT 1`;
+    if (open.length) return { status: "duplicate" as const, reason: "Ticker already has an open paper order" };
+    const settings = await transaction`SELECT new_entries_paused FROM app_settings WHERE id = true`;
+    if (settings[0]?.new_entries_paused) {
+      const reason = "New paper entries are paused";
+      await transaction`INSERT INTO risk_events (ticker, decision_key, event_type, reason) VALUES (${decision.ticker}, ${decisionKey}, 'entry_blocked', ${reason})`;
+      return { status: "rejected" as const, reason };
+    }
+    if (!decision.quote) return { status: "rejected" as const, reason: "Original executable quote is unavailable" };
+
+    const requestedCost = decision.quote.limitPriceCents * decision.quote.quantity + risk.feeCentsPerContract * decision.quote.quantity;
+    const exposure = await transaction`
+      SELECT
+        COALESCE((SELECT SUM(cost_basis_cents + total_fees_cents) FROM paper_positions), 0) AS positions,
+        COALESCE((SELECT SUM((requested_quantity - filled_quantity) * limit_price_cents + (requested_quantity - filled_quantity) * ${risk.feeCentsPerContract}) FROM paper_orders WHERE status IN ('resting', 'partial')), 0) AS orders,
+        (SELECT COUNT(DISTINCT ticker) FROM (SELECT ticker FROM paper_positions UNION SELECT ticker FROM paper_orders WHERE status IN ('resting', 'partial')) active) AS active_count,
+        EXISTS(SELECT 1 FROM paper_positions WHERE ticker = ${decision.ticker}) AS candidate_active,
+        COALESCE((SELECT SUM(price_cents * quantity + fee_cents) FROM paper_fills WHERE filled_at >= date_trunc('day', ${now.toISOString()}::timestamptz) AND filled_at < date_trunc('day', ${now.toISOString()}::timestamptz) + interval '1 day'), 0) AS daily
+    `;
+    const gameExposure = await transaction`
+      SELECT
+        COALESCE(SUM(p.cost_basis_cents + p.total_fees_cents), 0) +
+        COALESCE((SELECT SUM((o.requested_quantity - o.filled_quantity) * o.limit_price_cents + (o.requested_quantity - o.filled_quantity) * ${risk.feeCentsPerContract}) FROM paper_orders o JOIN markets om ON om.ticker = o.ticker WHERE om.game_id = candidate.game_id AND o.status IN ('resting', 'partial')), 0) AS total
+      FROM markets candidate
+      LEFT JOIN markets held ON held.game_id = candidate.game_id
+      LEFT JOIN paper_positions p ON p.ticker = held.ticker
+      WHERE candidate.ticker = ${decision.ticker}
+      GROUP BY candidate.game_id
+    `;
+    const totalExposure = Number(exposure[0].positions) + Number(exposure[0].orders);
+    const rejection = requestedCost > risk.maxCostPerEntryCents ? `Entry reservation exceeds ${risk.maxCostPerEntryCents}¢`
+      : Number(gameExposure[0]?.total ?? 0) + requestedCost > risk.maxOpenCostPerGameCents ? `Game exposure would exceed ${risk.maxOpenCostPerGameCents}¢`
+      : totalExposure + requestedCost > risk.maxTotalOpenCostCents ? `Total exposure would exceed ${risk.maxTotalOpenCostCents}¢`
+      : Number(exposure[0].daily) + requestedCost > risk.maxDailyNewCostCents ? `Daily new cost limit ${risk.maxDailyNewCostCents}¢ would be exceeded`
+      : Number(exposure[0].active_count) >= risk.maxConcurrentPositions && !exposure[0].candidate_active ? `Max concurrent positions ${risk.maxConcurrentPositions} reached`
+      : totalExposure + requestedCost > risk.startingBankrollCents ? "Insufficient paper cash for order reservation"
+      : null;
+    if (rejection) {
+      await transaction`INSERT INTO risk_events (ticker, decision_key, event_type, reason) VALUES (${decision.ticker}, ${decisionKey}, 'entry_blocked', ${rejection})`;
+      return { status: "rejected" as const, reason: rejection };
+    }
+
+    const fill = boundedYesFill(orderbook, decision.quote.quantity, decision.quote.limitPriceCents);
+    const filledQuantity = fill?.quantity ?? 0;
+    const status = filledQuantity === 0 ? "resting" : filledQuantity === decision.quote.quantity ? "filled" : "partial";
+    const orderId = `paper-${decisionKey}`;
+    const expiresAt = new Date(now.getTime() + orderTtlSeconds * 1_000).toISOString();
+    await transaction`
+      INSERT INTO paper_orders (id, decision_key, ticker, side, limit_price_cents, requested_quantity, filled_quantity, status, quote_as_of, expires_at, created_at, updated_at)
+      VALUES (${orderId}, ${decisionKey}, ${decision.ticker}, 'buy', ${decision.quote.limitPriceCents}, ${decision.quote.quantity}, ${filledQuantity}, ${status}, ${orderbook.asOf}, ${expiresAt}, ${now.toISOString()}, ${now.toISOString()})
+    `;
+    if (fill) {
+      const feeCents = fill.quantity * risk.feeCentsPerContract;
+      await transaction`
+        INSERT INTO paper_fills (order_id, ticker, price_cents, quantity, fee_cents, filled_at)
+        VALUES (${orderId}, ${decision.ticker}, ${fill.averagePriceCents}, ${fill.quantity}, ${feeCents}, ${now.toISOString()})
+      `;
+      await transaction`
+        INSERT INTO paper_positions (ticker, quantity, cost_basis_cents, total_fees_cents, created_at, updated_at)
+        VALUES (${decision.ticker}, ${fill.quantity}, ${fill.totalCostCents}, ${feeCents}, ${now.toISOString()}, ${now.toISOString()})
+        ON CONFLICT (ticker) DO UPDATE SET quantity = paper_positions.quantity + EXCLUDED.quantity,
+          cost_basis_cents = paper_positions.cost_basis_cents + EXCLUDED.cost_basis_cents,
+          total_fees_cents = paper_positions.total_fees_cents + EXCLUDED.total_fees_cents, updated_at = EXCLUDED.updated_at
+      `;
+    }
+    return { status: status as "resting" | "partial" | "filled", reason: null };
   });
 }

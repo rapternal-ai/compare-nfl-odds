@@ -9,7 +9,10 @@ export interface PaperPosition {
   updatedAt: string;
 }
 
+export type PaperOrderStatus = "resting" | "partial" | "filled" | "cancelled" | "expired";
+
 export interface PaperFill {
+  orderId: string;
   ticker: string;
   priceCents: number;
   quantity: number;
@@ -25,8 +28,11 @@ export interface PaperOrder {
   limitPriceCents: number;
   requestedQuantity: number;
   filledQuantity: number;
-  status: "filled" | "partial" | "cancelled";
+  status: PaperOrderStatus;
+  quoteAsOf: string;
+  expiresAt: string;
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface AccountState {
@@ -88,17 +94,10 @@ export function executePaperEntry(
     return { order: null, fill: null, position: null, rejection: `Max concurrent positions ${risk.maxConcurrentPositions} reached` };
   }
 
-  const fill: PaperFill = {
-    ticker: decision.ticker,
-    priceCents: quote.averagePriceCents,
-    quantity: quote.quantity,
-    feeCents: entryFee,
-    filledAt: now.toISOString(),
-  };
-
   const decisionKey = `${decision.ticker}:${decision.marketAsOf}`;
+  const orderId = `paper-${decisionKey}`;
   const order: PaperOrder = {
-    id: `paper-${decisionKey}`,
+    id: orderId,
     decisionKey,
     ticker: decision.ticker,
     side: "buy",
@@ -106,7 +105,18 @@ export function executePaperEntry(
     requestedQuantity: quote.quantity,
     filledQuantity: quote.quantity,
     status: "filled",
+    quoteAsOf: decision.marketAsOf,
+    expiresAt: new Date(now.getTime() + 15_000).toISOString(),
     createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+  };
+  const fill: PaperFill = {
+    orderId,
+    ticker: decision.ticker,
+    priceCents: quote.averagePriceCents,
+    quantity: quote.quantity,
+    feeCents: entryFee,
+    filledAt: now.toISOString(),
   };
 
   let position: PaperPosition;

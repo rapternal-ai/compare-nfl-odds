@@ -1,10 +1,37 @@
 import Decimal from "decimal.js";
 import type { ExecutableQuote, Orderbook, OrderbookLevel } from "./types";
 
-function yesAsks(noBids: OrderbookLevel[]): OrderbookLevel[] {
+export function yesAsks(noBids: OrderbookLevel[]): OrderbookLevel[] {
   return noBids
     .map(({ priceCents, quantity }) => ({ priceCents: 100 - priceCents, quantity }))
     .sort((a, b) => a.priceCents - b.priceCents);
+}
+
+export interface BoundedFill {
+  quantity: number;
+  averagePriceCents: number;
+  totalCostCents: number;
+}
+
+export function boundedYesFill(orderbook: Orderbook, quantity: number, limitPriceCents: number): BoundedFill | null {
+  if (!Number.isInteger(quantity) || quantity <= 0) throw new Error("Quantity must be a positive integer");
+  let remaining = quantity;
+  let filled = 0;
+  let total = new Decimal(0);
+  for (const level of yesAsks(orderbook.noBids)) {
+    if (level.priceCents > limitPriceCents) break;
+    const amount = Math.min(remaining, level.quantity);
+    total = total.plus(new Decimal(amount).times(level.priceCents));
+    filled += amount;
+    remaining -= amount;
+    if (!remaining) break;
+  }
+  if (!filled) return null;
+  return {
+    quantity: filled,
+    averagePriceCents: total.div(filled).toDecimalPlaces(4).toNumber(),
+    totalCostCents: total.toNumber(),
+  };
 }
 
 export function executableYesQuote(orderbook: Orderbook, quantity: number): ExecutableQuote | null {

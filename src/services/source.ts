@@ -1,4 +1,4 @@
-import type { CandidateDecision, ScanRecord } from "@/domain/types";
+import type { CandidateDecision, MarketDataProvider, ScanRecord } from "@/domain/types";
 import { FixtureMarketDataProvider, FixtureProbabilityProvider } from "@/providers/fixtures";
 import { ReadOnlyKalshiProvider } from "@/providers/kalshi";
 import { SportsGameOddsProbabilityProvider } from "@/providers/sports-game-odds";
@@ -8,16 +8,19 @@ import { scanMarketsDetailed } from "./scanner";
 export interface ScanResult {
   candidates: CandidateDecision[];
   records: ScanRecord[];
+  marketData: MarketDataProvider;
   source: "fixtures" | "kalshi";
   warning: string | null;
 }
 
 export async function loadCandidates(now = new Date()): Promise<ScanResult> {
   if (process.env.MARKET_DATA_SOURCE !== "kalshi") {
-    const records = await scanMarketsDetailed({ marketData: new FixtureMarketDataProvider(now), probabilities: new FixtureProbabilityProvider(now), now });
+    const marketData = new FixtureMarketDataProvider(now);
+    const records = await scanMarketsDetailed({ marketData, probabilities: new FixtureProbabilityProvider(now), now });
     return {
       candidates: records.map(({ decision }) => decision),
       records,
+      marketData,
       source: "fixtures",
       warning: null,
     };
@@ -31,21 +34,19 @@ export async function loadCandidates(now = new Date()): Promise<ScanResult> {
   const probabilities = hasLiveProbabilities
     ? new SportsGameOddsProbabilityProvider(process.env.SPORTS_GAME_ODDS_API_KEY!, undefined, undefined, undefined, Number.isFinite(oddsStartsWithinHours) ? oddsStartsWithinHours : undefined)
     : new UnavailableProbabilityProvider();
-  const records = await scanMarketsDetailed({
-    marketData: new ReadOnlyKalshiProvider(
-      baseUrl,
-      undefined,
-      undefined,
-      undefined,
-      gameFilter,
-      Number.isFinite(gameStartsWithinHours) ? gameStartsWithinHours : undefined,
-    ),
-    probabilities,
-    now,
-  });
+  const marketData = new ReadOnlyKalshiProvider(
+    baseUrl,
+    undefined,
+    undefined,
+    undefined,
+    gameFilter,
+    Number.isFinite(gameStartsWithinHours) ? gameStartsWithinHours : undefined,
+  );
+  const records = await scanMarketsDetailed({ marketData, probabilities, now });
   return {
     candidates: records.map(({ decision }) => decision),
     records,
+    marketData,
     source: "kalshi",
     warning: hasLiveProbabilities ? null : "Live market data is enabled, but no licensed probability feed is configured. All candidates must remain NO TRADE.",
   };

@@ -25,7 +25,7 @@ export default async function PortfolioPage() {
       <section className="summary">
         <article><span>Cash</span><strong>${money(summary.cashCents)}</strong></article>
         <article><span>At risk</span><strong>${money(summary.atRiskCents)}</strong></article>
-        <article><span>Today&apos;s cost</span><strong>${money(summary.dayCostCents)}</strong></article>
+        <article><span>Reserved</span><strong>${money(summary.reservedCents)}</strong></article>
         <article><span>New entries</span><strong>{summary.controls.newEntriesPaused ? "Paused" : "Active"}</strong></article>
       </section>
 
@@ -55,6 +55,48 @@ export default async function PortfolioPage() {
                   <td>{(p.costBasisCents / p.quantity).toFixed(2)}¢</td>
                   <td>${money(p.costBasisCents)}</td>
                   <td>${money(p.totalFeesCents)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panelHeading"><h2>Paper orders</h2></div>
+        <div className="tableWrap">
+          <table>
+            <thead><tr><th>Ticker</th><th>Status</th><th>Filled</th><th>Limit</th><th>Expires</th></tr></thead>
+            <tbody>
+              {summary.orders.length === 0 && <tr><td colSpan={5}>No paper orders yet.</td></tr>}
+              {summary.orders.map((order) => (
+                <tr key={order.id}>
+                  <td><strong>{order.ticker}</strong><small>{order.id}</small></td>
+                  <td><span className={`badge ${order.status === "filled" ? "trade" : "no_trade"}`}>{order.status}</span></td>
+                  <td>{order.filledQuantity} / {order.requestedQuantity}</td>
+                  <td>{order.limitPriceCents}¢</td>
+                  <td>{order.expiresAt ? new Date(order.expiresAt).toISOString().slice(0, 19).replace("T", " ") : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panelHeading"><h2>Recent fills</h2></div>
+        <div className="tableWrap">
+          <table>
+            <thead><tr><th>Ticker</th><th>Quantity</th><th>Price</th><th>Fee</th><th>Filled</th></tr></thead>
+            <tbody>
+              {summary.fills.length === 0 && <tr><td colSpan={5}>No paper fills yet.</td></tr>}
+              {summary.fills.map((fill, index) => (
+                <tr key={`${fill.orderId}-${fill.filledAt}-${index}`}>
+                  <td><strong>{fill.ticker}</strong></td>
+                  <td>{fill.quantity}</td>
+                  <td>{fill.priceCents.toFixed(2)}¢</td>
+                  <td>{fill.feeCents}¢</td>
+                  <td>{new Date(fill.filledAt).toISOString().slice(0, 19).replace("T", " ")}</td>
                 </tr>
               ))}
             </tbody>
