@@ -55,4 +55,30 @@ describe("SportsGameOddsProbabilityProvider", () => {
     assert.equal(calls, 2);
     assert.ok(estimate.probabilityBps > 0);
   });
+
+  it("does not amplify a 429 across outcomes in the same scan", async () => {
+    let calls = 0;
+    const limitedRequest = async () => {
+      calls += 1;
+      return new Response("rate limited", { status: 429 });
+    };
+    const provider = new SportsGameOddsProbabilityProvider("secret", limitedRequest as typeof fetch);
+    await assert.rejects(provider.estimate(game, "Washington", new Date()), /cooldown active/);
+    await assert.rejects(provider.estimate(game, "Dallas", new Date()), /cooldown active/);
+    assert.equal(calls, 1);
+  });
+
+  it("shares a ten-minute event response across provider instances", async () => {
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      return new Response(JSON.stringify(payload));
+    };
+    const asOf = new Date("2026-09-13T12:00:00Z");
+    const first = new SportsGameOddsProbabilityProvider("secret", request as typeof fetch, "https://cache-test.example/v2", 3, 336, 600_000);
+    const second = new SportsGameOddsProbabilityProvider("secret", request as typeof fetch, "https://cache-test.example/v2", 3, 336, 600_000);
+    await first.estimate(game, "Washington", asOf);
+    await second.estimate(game, "Dallas", asOf);
+    assert.equal(calls, 1);
+  });
 });

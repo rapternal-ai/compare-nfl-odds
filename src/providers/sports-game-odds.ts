@@ -26,14 +26,16 @@ type Event = z.infer<typeof eventSchema>;
 type TeamNames = z.infer<typeof teamSchema>["names"];
 type Fetch = typeof fetch;
 
+const sharedEvents = new Map<string, { expiresAt: number; promise: Promise<Event[]> }>();
+
 const delay = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); });
 const retryDelayMs = (headers: Headers, attempt: number) => {
   const header = headers.get("retry-after");
   if (!header) return Math.min(250 * 2 ** attempt, 2_000);
   const seconds = Number(header);
-  if (Number.isFinite(seconds)) return seconds * 1_000;
+  if (Number.isFinite(seconds)) return Math.min(seconds * 1_000, 30_000);
   const date = Date.parse(header);
-  if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  if (Number.isFinite(date)) return Math.min(Math.max(0, date - Date.now()), 30_000);
   return Math.min(250 * 2 ** attempt, 2_000);
 };
 
@@ -59,13 +61,29 @@ export class SportsGameOddsProbabilityProvider implements ProbabilityProvider {
     private readonly request: Fetch = fetch,
     private readonly baseUrl = "https://api.sportsgameodds.com/v2",
     private readonly maxRetries = 3,
-    private readonly startsWithinHours = 14 * 24,
+    private readonly startsWithinHours = 72,
+    private readonly cacheTtlMs = request === fetch ? 10 * 60_000 : 0,
   ) {
     if (!apiKey) throw new Error("SPORTS_GAME_ODDS_API_KEY is required");
   }
 
   private async events(asOf: Date) {
-    if (!this.eventsPromise) this.eventsPromise = this.fetchEvents(asOf).catch((error) => { this.eventsPromise = null; throw error; });
+    if (this.eventsPromise) return this.eventsPromise;
+    const bucket = Math.floor(asOf.getTime() / Math.max(this.cacheTtlMs, 1));
+    const key = `${this.baseUrl}:${this.startsWithinHours}:${bucket}`;
+    const cached = sharedEvents.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      this.eventsPromise = cached.promise;
+      return this.eventsPromise;
+    }
+    this.eventsPromise = this.fetchEvents(asOf);
+    if (this.cacheTtlMs > 0) {
+      sharedEvents.set(key, { expiresAt: Date.now() + this.cacheTtlMs, promise: this.eventsPromise });
+      this.eventsPromise.catch(() => {
+        const current = sharedEvents.get(key);
+        if (current?.promise === this.eventsPromise) current.expiresAt = Date.now() + 60_000;
+      });
+    }
     return this.eventsPromise;
   }
 
@@ -78,8 +96,11 @@ export class SportsGameOddsProbabilityProvider implements ProbabilityProvider {
         signal: AbortSignal.timeout(10_000),
       });
       if (response.ok) return response.json();
-      lastError = `SportsGameOdds request failed: ${response.status}`;
-      const retryable = response.status === 429 || response.status >= 500;
+      const retryAfter = response.headers.get("retry-after");
+      lastError = response.status === 429
+        ? `SportsGameOdds request failed: 429${retryAfter ? `; retry after ${retryAfter}` : "; request cooldown active"}`
+        : `SportsGameOdds request failed: ${response.status}`;
+      const retryable = response.status >= 500 || (response.status === 429 && Boolean(retryAfter));
       if (retryable && attempt < this.maxRetries - 1) {
         await delay(retryDelayMs(response.headers, attempt));
         continue;
