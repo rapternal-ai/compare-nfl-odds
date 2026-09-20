@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { JSONValue } from "postgres";
 import type { CandidateDecision, DecisionAction, Market, Orderbook, RiskConfig, ScanRecord } from "@/domain/types";
 import { executePaperEntry, type PaperFill, type PaperOrder, type PaperPosition } from "@/domain/portfolio";
-import { boundedYesFill } from "@/domain/pricing";
+import { boundedYesFill, executableYesBid } from "@/domain/pricing";
 import type { Database } from "./client";
 
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -210,7 +210,7 @@ export async function getPaperControlState(sql: Database, fallback: RiskConfig):
   ]);
   const config = configs[0]?.config;
   return {
-    risk: config ? (typeof config === "string" ? JSON.parse(config) : config) as RiskConfig : fallback,
+    risk: config ? { ...fallback, ...(typeof config === "string" ? JSON.parse(config) : config) } as RiskConfig : fallback,
     newEntriesPaused: settings[0]?.new_entries_paused ?? false,
     updatedAt: settings[0]?.updated_at ?? configs[0]?.created_at ?? null,
   };
@@ -248,12 +248,19 @@ export interface PaperFillSummary {
   filledAt: string;
 }
 
+export interface ValuedPaperPosition extends PaperPosition {
+  marketValueCents: number | null;
+  unrealizedPnlCents: number | null;
+  markAsOf: string | null;
+}
+
 export interface PortfolioSummary {
   cashCents: number;
   atRiskCents: number;
   reservedCents: number;
   dayCostCents: number;
-  positions: PaperPosition[];
+  realizedPnlCents: number;
+  positions: ValuedPaperPosition[];
   orders: PaperOrderSummary[];
   fills: PaperFillSummary[];
 }
@@ -275,8 +282,8 @@ export async function getOpenPositions(sql: Database): Promise<PaperPosition[]> 
   return rows.map((r) => ({
     ticker: r.ticker,
     quantity: r.quantity,
-    costBasisCents: r.cost_basis_cents,
-    totalFeesCents: r.total_fees_cents,
+    costBasisCents: Number(r.cost_basis_cents),
+    totalFeesCents: Number(r.total_fees_cents),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }));
@@ -293,21 +300,31 @@ export async function getTodaysFillCost(sql: Database, now: Date): Promise<numbe
 }
 
 export async function loadPortfolio(sql: Database, risk: RiskConfig, now: Date): Promise<PortfolioSummary> {
-  const [positions, orderRows, fillRows, reserveRows] = await Promise.all([
+  const [positions, orderRows, fillRows, reserveRows, markRows, realizedRows] = await Promise.all([
     getOpenPositions(sql),
     sql`SELECT id, ticker, status, limit_price_cents, requested_quantity, filled_quantity, quote_as_of, expires_at, created_at FROM paper_orders ORDER BY created_at DESC LIMIT 50`,
     sql`SELECT order_id, ticker, price_cents, quantity, fee_cents, filled_at FROM paper_fills ORDER BY filled_at DESC LIMIT 50`,
     sql`SELECT COALESCE(SUM((requested_quantity - filled_quantity) * limit_price_cents + (requested_quantity - filled_quantity) * ${risk.feeCentsPerContract}), 0) AS total FROM paper_orders WHERE status IN ('resting', 'partial')`,
+    sql`SELECT p.ticker, p.quantity, p.cost_basis_cents, p.total_fees_cents, s.orderbook, s.as_of FROM paper_positions p LEFT JOIN LATERAL (SELECT orderbook, as_of FROM market_snapshots WHERE ticker = p.ticker ORDER BY as_of DESC LIMIT 1) s ON true`,
+    sql`SELECT COALESCE(SUM(pnl_cents), 0) AS total FROM paper_realized_events`,
   ]);
   const atRiskCents = positions.reduce((sum, p) => sum + p.costBasisCents + p.totalFeesCents, 0);
   const reservedCents = Number(reserveRows[0].total);
   const dayCostCents = await getTodaysFillCost(sql, now);
+  const marks = new Map(markRows.map((r) => {
+    const orderbook = typeof r.orderbook === "string" ? JSON.parse(r.orderbook) : r.orderbook;
+    const bid = orderbook ? executableYesBid(orderbook, r.quantity) : null;
+    const value = bid ? bid.totalCostCents - r.quantity * risk.feeCentsPerContract : null;
+    return [r.ticker, { marketValueCents: value, unrealizedPnlCents: value === null ? null : value - Number(r.cost_basis_cents) - Number(r.total_fees_cents), markAsOf: r.as_of ?? null }];
+  }));
+  const realizedPnlCents = Number(realizedRows[0].total);
   return {
-    cashCents: risk.startingBankrollCents - atRiskCents - reservedCents,
+    cashCents: risk.startingBankrollCents + realizedPnlCents - atRiskCents - reservedCents,
     atRiskCents,
     reservedCents,
     dayCostCents,
-    positions,
+    realizedPnlCents,
+    positions: positions.map((p) => ({ ...p, ...(marks.get(p.ticker) ?? { marketValueCents: null, unrealizedPnlCents: null, markAsOf: null }) })),
     orders: orderRows.map((r) => ({
       id: r.id,
       ticker: r.ticker,
@@ -523,6 +540,8 @@ export async function revalidateAndExecutePaperEntry(
         COALESCE((SELECT SUM((requested_quantity - filled_quantity) * limit_price_cents + (requested_quantity - filled_quantity) * ${risk.feeCentsPerContract}) FROM paper_orders WHERE status IN ('resting', 'partial')), 0) AS orders,
         (SELECT COUNT(DISTINCT ticker) FROM (SELECT ticker FROM paper_positions UNION SELECT ticker FROM paper_orders WHERE status IN ('resting', 'partial')) active) AS active_count,
         EXISTS(SELECT 1 FROM paper_positions WHERE ticker = ${decision.ticker}) AS candidate_active,
+        COALESCE((SELECT SUM(GREATEST(-pnl_cents, 0)) FROM paper_realized_events WHERE created_at >= date_trunc('day', ${now.toISOString()}::timestamptz) AND created_at < date_trunc('day', ${now.toISOString()}::timestamptz) + interval '1 day'), 0) AS realized_loss,
+        COALESCE((SELECT SUM(pnl_cents) FROM paper_realized_events), 0) AS realized_total,
         COALESCE((SELECT SUM(price_cents * quantity + fee_cents) FROM paper_fills WHERE filled_at >= date_trunc('day', ${now.toISOString()}::timestamptz) AND filled_at < date_trunc('day', ${now.toISOString()}::timestamptz) + interval '1 day'), 0) AS daily
     `;
     const gameExposure = await transaction`
@@ -536,12 +555,13 @@ export async function revalidateAndExecutePaperEntry(
       GROUP BY candidate.game_id
     `;
     const totalExposure = Number(exposure[0].positions) + Number(exposure[0].orders);
-    const rejection = requestedCost > risk.maxCostPerEntryCents ? `Entry reservation exceeds ${risk.maxCostPerEntryCents}¢`
+    const rejection = Number(exposure[0].realized_loss) >= risk.maxDailyRealizedLossCents ? `Daily realized loss limit ${risk.maxDailyRealizedLossCents}¢ reached`
+      : requestedCost > risk.maxCostPerEntryCents ? `Entry reservation exceeds ${risk.maxCostPerEntryCents}¢`
       : Number(gameExposure[0]?.total ?? 0) + requestedCost > risk.maxOpenCostPerGameCents ? `Game exposure would exceed ${risk.maxOpenCostPerGameCents}¢`
       : totalExposure + requestedCost > risk.maxTotalOpenCostCents ? `Total exposure would exceed ${risk.maxTotalOpenCostCents}¢`
       : Number(exposure[0].daily) + requestedCost > risk.maxDailyNewCostCents ? `Daily new cost limit ${risk.maxDailyNewCostCents}¢ would be exceeded`
       : Number(exposure[0].active_count) >= risk.maxConcurrentPositions && !exposure[0].candidate_active ? `Max concurrent positions ${risk.maxConcurrentPositions} reached`
-      : totalExposure + requestedCost > risk.startingBankrollCents ? "Insufficient paper cash for order reservation"
+      : totalExposure + requestedCost > risk.startingBankrollCents + Number(exposure[0].realized_total) ? "Insufficient paper cash for order reservation"
       : null;
     if (rejection) {
       await transaction`INSERT INTO risk_events (ticker, decision_key, event_type, reason) VALUES (${decision.ticker}, ${decisionKey}, 'entry_blocked', ${rejection})`;
@@ -572,5 +592,49 @@ export async function revalidateAndExecutePaperEntry(
       `;
     }
     return { status: status as "resting" | "partial" | "filled", reason: null };
+  });
+}
+
+export async function executePaperExit(sql: Database, record: ScanRecord, risk: RiskConfig, now: Date) {
+  const positionRows = await sql`SELECT quantity, cost_basis_cents, total_fees_cents FROM paper_positions WHERE ticker = ${record.market.ticker}`;
+  if (!positionRows.length || !record.decision.probability || !record.market.game) return null;
+  const position = positionRows[0];
+  const bid = executableYesBid(record.orderbook, position.quantity);
+  if (!bid) return null;
+  const exitFee = position.quantity * risk.feeCentsPerContract;
+  const netProceeds = bid.totalCostCents - exitFee;
+  const pnl = netProceeds - Number(position.cost_basis_cents) - Number(position.total_fees_cents);
+  const holdEdgeBps = record.decision.probability.lowerBoundBps - bid.averagePriceCents * 100 - risk.feeCentsPerContract * 100;
+  const minutesUntilStart = (new Date(record.market.game.startsAt).getTime() - now.getTime()) / 60_000;
+  if (holdEdgeBps > risk.autoExitIfNetEdgeBelowBps || pnl < risk.autoExitMinNetProfitCents || minutesUntilStart < risk.autoExitMinMinutesBeforeStart) return null;
+  return sql.begin(async (transaction) => {
+    await transaction`SELECT pg_advisory_xact_lock(hashtext('paper-entry-risk'))`;
+    const locked = await transaction`SELECT quantity, cost_basis_cents, total_fees_cents FROM paper_positions WHERE ticker = ${record.market.ticker} FOR UPDATE`;
+    if (!locked.length || locked[0].quantity !== position.quantity) return null;
+    const orderId = `paper-exit-${record.market.ticker}:${record.orderbook.asOf}`;
+    const reason = `Conservative hold edge ${holdEdgeBps} bps fell below exit threshold with net profit ${pnl.toFixed(2)}¢`;
+    await transaction`INSERT INTO paper_orders (id, decision_key, ticker, side, limit_price_cents, requested_quantity, filled_quantity, status, quote_as_of, expires_at, created_at, updated_at) VALUES (${orderId}, ${orderId}, ${record.market.ticker}, 'sell', ${bid.averagePriceCents}, ${position.quantity}, ${position.quantity}, 'filled', ${record.orderbook.asOf}, ${now.toISOString()}, ${now.toISOString()}, ${now.toISOString()}) ON CONFLICT (id) DO NOTHING`;
+    await transaction`INSERT INTO paper_fills (order_id, ticker, side, price_cents, quantity, fee_cents, filled_at) VALUES (${orderId}, ${record.market.ticker}, 'sell', ${bid.averagePriceCents}, ${position.quantity}, ${exitFee}, ${now.toISOString()})`;
+    await transaction`INSERT INTO paper_realized_events (ticker, event_type, quantity, proceeds_cents, cost_basis_cents, fee_cents, pnl_cents, reason, created_at) VALUES (${record.market.ticker}, 'exit', ${position.quantity}, ${bid.totalCostCents}, ${Number(position.cost_basis_cents)}, ${Number(position.total_fees_cents) + exitFee}, ${pnl}, ${reason}, ${now.toISOString()})`;
+    await transaction`DELETE FROM paper_positions WHERE ticker = ${record.market.ticker}`;
+    return { pnlCents: pnl, reason };
+  });
+}
+
+export async function settlePaperPosition(sql: Database, ticker: string, settlementValueCents: number, reason: string, now = new Date()) {
+  return sql.begin(async (transaction) => {
+    await transaction`SELECT pg_advisory_xact_lock(hashtext('paper-entry-risk'))`;
+    const rows = await transaction`SELECT quantity, cost_basis_cents, total_fees_cents FROM paper_positions WHERE ticker = ${ticker} FOR UPDATE`;
+    if (!rows.length) throw new Error("Paper position not found");
+    const quantity = rows[0].quantity;
+    const proceeds = quantity * settlementValueCents;
+    const costBasis = Number(rows[0].cost_basis_cents);
+    const fees = Number(rows[0].total_fees_cents);
+    const pnl = proceeds - costBasis - fees;
+    await transaction`INSERT INTO paper_realized_events (ticker, event_type, quantity, proceeds_cents, cost_basis_cents, fee_cents, pnl_cents, settlement_value_cents, reason, created_at) VALUES (${ticker}, 'settlement', ${quantity}, ${proceeds}, ${costBasis}, ${fees}, ${pnl}, ${settlementValueCents}, ${reason}, ${now.toISOString()})`;
+    await transaction`INSERT INTO paper_fills (ticker, side, price_cents, quantity, fee_cents, filled_at) VALUES (${ticker}, 'settlement', ${settlementValueCents}, ${quantity}, 0, ${now.toISOString()})`;
+    await transaction`UPDATE paper_orders SET status = 'cancelled', updated_at = ${now.toISOString()} WHERE ticker = ${ticker} AND status IN ('resting', 'partial')`;
+    await transaction`DELETE FROM paper_positions WHERE ticker = ${ticker}`;
+    return { quantity, proceedsCents: proceeds, pnlCents: pnl };
   });
 }

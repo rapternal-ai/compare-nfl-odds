@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { loadPortfolioSummary } from "@/services/portfolio";
-import { saveRiskAction, setEntryPauseAction } from "./actions";
+import { saveRiskAction, setEntryPauseAction, settlePaperAction } from "./actions";
 
 const money = (cents: number) => `${(cents / 100).toFixed(2)}`;
 
@@ -26,6 +26,7 @@ export default async function PortfolioPage() {
         <article><span>Cash</span><strong>${money(summary.cashCents)}</strong></article>
         <article><span>At risk</span><strong>${money(summary.atRiskCents)}</strong></article>
         <article><span>Reserved</span><strong>${money(summary.reservedCents)}</strong></article>
+        <article><span>Realized P&amp;L</span><strong>${money(summary.realizedPnlCents)}</strong></article>
         <article><span>New entries</span><strong>{summary.controls.newEntriesPaused ? "Paused" : "Active"}</strong></article>
       </section>
 
@@ -42,19 +43,26 @@ export default async function PortfolioPage() {
         <div className="tableWrap">
           <table>
             <thead>
-              <tr><th>Ticker</th><th>Quantity</th><th>Avg entry</th><th>Cost basis</th><th>Fees</th></tr>
+              <tr><th>Ticker</th><th>Quantity</th><th>Avg entry</th><th>Market value</th><th>Unrealized P&amp;L</th><th>Settlement</th></tr>
             </thead>
             <tbody>
               {summary.positions.length === 0 && (
-                <tr><td colSpan={5} className="empty">No paper positions yet.</td></tr>
+                <tr><td colSpan={6} className="empty">No paper positions yet.</td></tr>
               )}
               {summary.positions.map((p) => (
                 <tr key={p.ticker}>
                   <td><strong>{p.ticker}</strong></td>
                   <td>{p.quantity}</td>
                   <td>{(p.costBasisCents / p.quantity).toFixed(2)}¢</td>
-                  <td>${money(p.costBasisCents)}</td>
-                  <td>${money(p.totalFeesCents)}</td>
+                  <td>{p.marketValueCents === null ? "Insufficient bid depth" : `$${money(p.marketValueCents)}`}</td>
+                  <td>{p.unrealizedPnlCents === null ? "—" : `$${money(p.unrealizedPnlCents)}`}</td>
+                  <td>
+                    <form action={settlePaperAction}>
+                      <input type="hidden" name="ticker" value={p.ticker} />
+                      <button name="settlementValueCents" value="100">Settle Yes</button>
+                      <button name="settlementValueCents" value="0">Settle No</button>
+                    </form>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -113,6 +121,10 @@ export default async function PortfolioPage() {
           <label>Max total open cost ($)<input name="maxTotalOpenCost" type="number" min="0.01" step="0.01" defaultValue={money(risk.maxTotalOpenCostCents)} required /></label>
           <label>Max daily new cost ($)<input name="maxDailyNewCost" type="number" min="0.01" step="0.01" defaultValue={money(risk.maxDailyNewCostCents)} required /></label>
           <label>Max concurrent positions<input name="maxConcurrentPositions" type="number" min="1" step="1" defaultValue={risk.maxConcurrentPositions} required /></label>
+          <label>Max daily realized loss ($)<input name="maxDailyRealizedLoss" type="number" min="0.01" step="0.01" defaultValue={money(risk.maxDailyRealizedLossCents)} required /></label>
+          <label>Exit edge threshold (percentage points)<input name="autoExitIfNetEdgeBelow" type="number" step="0.01" defaultValue={risk.autoExitIfNetEdgeBelowBps / 100} required /></label>
+          <label>Minimum exit profit ($)<input name="autoExitMinNetProfit" type="number" min="0" step="0.01" defaultValue={money(risk.autoExitMinNetProfitCents)} required /></label>
+          <label>Minimum minutes before start<input name="autoExitMinMinutesBeforeStart" type="number" min="0" step="1" defaultValue={risk.autoExitMinMinutesBeforeStart} required /></label>
           <label>Fee per contract (¢)<input name="feeCentsPerContract" type="number" min="0" step="1" defaultValue={risk.feeCentsPerContract} required /></label>
           <button type="submit">Save risk configuration</button>
         </form>

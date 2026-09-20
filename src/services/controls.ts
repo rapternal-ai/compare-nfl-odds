@@ -12,6 +12,10 @@ const riskSchema = z.object({
   maxTotalOpenCostCents: z.coerce.number().int().positive(),
   maxDailyNewCostCents: z.coerce.number().int().positive(),
   maxConcurrentPositions: z.coerce.number().int().positive(),
+  maxDailyRealizedLossCents: z.coerce.number().int().positive(),
+  autoExitIfNetEdgeBelowBps: z.coerce.number().int(),
+  autoExitMinNetProfitCents: z.coerce.number().int().nonnegative(),
+  autoExitMinMinutesBeforeStart: z.coerce.number().int().nonnegative(),
   feeCentsPerContract: z.coerce.number().int().nonnegative(),
 });
 

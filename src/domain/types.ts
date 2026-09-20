@@ -73,6 +73,10 @@ export interface RiskConfig {
   maxTotalOpenCostCents: number;
   maxDailyNewCostCents: number;
   maxConcurrentPositions: number;
+  maxDailyRealizedLossCents: number;
+  autoExitIfNetEdgeBelowBps: number;
+  autoExitMinNetProfitCents: number;
+  autoExitMinMinutesBeforeStart: number;
   feeCentsPerContract: number;
 }
 

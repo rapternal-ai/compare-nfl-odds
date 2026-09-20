@@ -13,6 +13,20 @@ export interface BoundedFill {
   totalCostCents: number;
 }
 
+export function executableYesBid(orderbook: Orderbook, quantity: number): BoundedFill | null {
+  if (!Number.isInteger(quantity) || quantity <= 0) throw new Error("Quantity must be a positive integer");
+  let remaining = quantity;
+  let total = new Decimal(0);
+  for (const level of [...orderbook.yesBids].sort((a, b) => b.priceCents - a.priceCents)) {
+    const amount = Math.min(remaining, level.quantity);
+    total = total.plus(new Decimal(amount).times(level.priceCents));
+    remaining -= amount;
+    if (!remaining) break;
+  }
+  if (remaining) return null;
+  return { quantity, averagePriceCents: total.div(quantity).toDecimalPlaces(4).toNumber(), totalCostCents: total.toNumber() };
+}
+
 export function boundedYesFill(orderbook: Orderbook, quantity: number, limitPriceCents: number): BoundedFill | null {
   if (!Number.isInteger(quantity) || quantity <= 0) throw new Error("Quantity must be a positive integer");
   let remaining = quantity;

@@ -23,5 +23,9 @@ export const defaultRisk: RiskConfig = {
   maxTotalOpenCostCents: 10_000_00,
   maxDailyNewCostCents: 3_000_00,
   maxConcurrentPositions: 8,
+  maxDailyRealizedLossCents: 2_000,
+  autoExitIfNetEdgeBelowBps: -200,
+  autoExitMinNetProfitCents: 200,
+  autoExitMinMinutesBeforeStart: 10,
   feeCentsPerContract: 1,
 };

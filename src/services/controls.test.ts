@@ -10,6 +10,10 @@ const valid = {
   maxTotalOpenCostCents: 10_000,
   maxDailyNewCostCents: 5_000,
   maxConcurrentPositions: 8,
+  maxDailyRealizedLossCents: 2_000,
+  autoExitIfNetEdgeBelowBps: -200,
+  autoExitMinNetProfitCents: 200,
+  autoExitMinMinutesBeforeStart: 10,
   feeCentsPerContract: 1,
 };
 

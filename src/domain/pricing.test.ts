@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { boundedYesFill, executableYesQuote } from "./pricing";
+import { boundedYesFill, executableYesBid, executableYesQuote } from "./pricing";
 import type { Orderbook } from "./types";
 
 const book: Orderbook = {
@@ -24,6 +24,15 @@ describe("executableYesQuote", () => {
 
   it("refuses insufficient depth", () => {
     assert.equal(executableYesQuote(book, 31), null);
+  });
+
+  it("values exits by walking executable Yes bids", () => {
+    assert.deepEqual(executableYesBid({ ...book, yesBids: [{ priceCents: 60, quantity: 5 }, { priceCents: 58, quantity: 10 }] }, 10), {
+      quantity: 10,
+      averagePriceCents: 59,
+      totalCostCents: 590,
+    });
+    assert.equal(executableYesBid(book, 51), null);
   });
 
   it("partially fills only at or below the limit price", () => {
